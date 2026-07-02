@@ -1,7 +1,7 @@
 import asyncio
 import os
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import aiohttp
 
 app = FastAPI()
@@ -13,6 +13,13 @@ class Lead(BaseModel):
     name: str
     contact: str
     project: str = ""
+
+    @field_validator("name", "contact")
+    @classmethod
+    def not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v.strip()
 
 async def notify_admins(text: str):
     async with aiohttp.ClientSession() as session:
