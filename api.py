@@ -1,0 +1,38 @@
+import asyncio
+import os
+from fastapi import FastAPI
+from pydantic import BaseModel
+import aiohttp
+
+app = FastAPI()
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_IDS = [int(x) for x in os.environ["ADMIN_IDS"].split(",") if x]
+
+class Lead(BaseModel):
+    name: str
+    contact: str
+    project: str = ""
+
+async def notify_admins(text: str):
+    async with aiohttp.ClientSession() as session:
+        for admin_id in ADMIN_IDS:
+            await session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
+            )
+
+@app.post("/lead")
+async def receive_lead(lead: Lead):
+    text = (
+        f"🔔 <b>Нова заявка з сайту</b>\n\n"
+        f"👤 Ім'я: {lead.name}\n"
+        f"📞 Контакт: {lead.contact}\n"
+        f"💬 Проект: {lead.project or '—'}"
+    )
+    asyncio.create_task(notify_admins(text))
+    return {"ok": True}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
