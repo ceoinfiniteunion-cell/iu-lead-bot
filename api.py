@@ -1,9 +1,9 @@
-import asyncio
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import aiohttp
+import asyncpg
 
 app = FastAPI()
 
@@ -16,11 +16,13 @@ app.add_middleware(
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = [int(x) for x in os.environ["ADMIN_IDS"].split(",") if x]
+DB_URL = os.environ["DATABASE_URL"]
 
 class Lead(BaseModel):
     name: str
     contact: str
     project: str = ""
+
     @field_validator("name", "contact")
     @classmethod
     def not_empty(cls, v: str) -> str:
@@ -36,10 +38,23 @@ async def notify_admins(text: str):
                 json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
             )
 
+async def save_to_db(name: str, contact: str, project: str) -> int:
+    conn = await asyncpg.connect(DB_URL)
+    try:
+        lead_id = await conn.fetchval(
+            """INSERT INTO leads (user_id, username, name, service, budget, timeline, contact)
+               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+            0, "site", name, project or "З сайту", "—", "—", contact
+        )
+        return lead_id
+    finally:
+        await conn.close()
+
 @app.post("/lead")
 async def receive_lead(lead: Lead):
+    lead_id = await save_to_db(lead.name, lead.contact, lead.project)
     text = (
-        f"🔔 <b>Нова заявка з сайту</b>\n\n"
+        f"🔔 <b>Нова заявка з сайту #{lead_id}</b>\n\n"
         f"👤 Ім'я: {lead.name}\n"
         f"📞 Контакт: {lead.contact}\n"
         f"💬 Проект: {lead.project or '—'}"
