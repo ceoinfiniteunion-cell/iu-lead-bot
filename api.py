@@ -1,10 +1,18 @@
 import asyncio
 import os
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import aiohttp
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://ceoinfiniteunion-cell.github.io", "http://localhost"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = [int(x) for x in os.environ["ADMIN_IDS"].split(",") if x]
@@ -13,7 +21,6 @@ class Lead(BaseModel):
     name: str
     contact: str
     project: str = ""
-
     @field_validator("name", "contact")
     @classmethod
     def not_empty(cls, v: str) -> str:
