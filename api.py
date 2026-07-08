@@ -9,7 +9,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ceoinfiniteunion-cell.github.io", "http://localhost"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,7 +44,7 @@ async def receive_lead(lead: Lead):
         f"📞 Контакт: {lead.contact}\n"
         f"💬 Проект: {lead.project or '—'}"
     )
-    asyncio.create_task(notify_admins(text))
+    await notify_admins(text)
     return {"ok": True}
 
 @app.get("/health")
