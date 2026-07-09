@@ -75,6 +75,30 @@ async def receive_lead(lead: Lead):
     await notify_admins(text)
     return {"ok": True}
 
+@app.post("/generate")
+async def generate_site(req: dict):
+    import os
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return {"error": "no key"}
+    async with aiohttp.ClientSession() as session:
+        resp = await session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 4000,
+                "system": req.get("system", ""),
+                "messages": [{"role": "user", "content": req.get("prompt", "")}]
+            }
+        )
+        data = await resp.json()
+    return data
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
