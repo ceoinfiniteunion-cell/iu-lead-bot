@@ -76,6 +76,7 @@ class Lead(BaseModel):
     budget: str = ""
     deadline: str = ""
     project: str = ""
+    website: str = ""  # honeypot
 
     @field_validator("name", "contact")
     @classmethod
@@ -123,6 +124,9 @@ async def save_to_db(request: Request, lead: "Lead") -> int:
 
 @app.post("/lead")
 async def receive_lead(lead: Lead, request: Request):
+    if lead.website:
+        logger.warning("Honeypot triggered from IP %s", request.client.host)
+        return {"ok": True}  # тихо ігноруємо бота
     try:
         lead_id = await save_to_db(request, lead)
         logger.info("Lead #%d saved (name=%s)", lead_id, lead.name)
