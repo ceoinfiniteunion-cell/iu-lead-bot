@@ -108,13 +108,17 @@ async def lead_fill(cb: CallbackQuery, state: FSMContext):
             f"💰 Бюджет: {extra.get('buh_budget', lead.get('budget','—'))}\n"
             f"📅 Дедлайн: {extra.get('deadline','—')}"
         )
-        buh_ids = [int(x) for x in os.environ.get("BUH_OWNER_IDS", "").split(",") if x]
+        buh_url = os.environ.get("BUH_API_URL", "")
         async with aiohttp.ClientSession() as session:
-            for buh_id in buh_ids:
-                await session.post(
-                    f"https://api.telegram.org/bot{BUH_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": buh_id, "text": text, "parse_mode": "HTML"}
-                )
+            await session.post(buh_url, json={
+                "name": lead.get("name","—"),
+                "contact": extra.get("tg_username", lead.get("contact","—")),
+                "phone": extra.get("phone","—"),
+                "project_type": extra.get("project_type", lead.get("service","—")),
+                "budget": extra.get("buh_budget", lead.get("budget","—")),
+                "deadline": extra.get("deadline","—"),
+                "project": lead.get("contact","—")
+            })
         await cb.answer("✅ Відправлено в бухгалтерію!", show_alert=True)
         return
 
