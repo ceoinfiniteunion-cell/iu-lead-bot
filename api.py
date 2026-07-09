@@ -1,9 +1,10 @@
-import os, time
+import os
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import aiohttp
 import asyncpg
+import redis.asyncio as aioredis
 
 app = FastAPI()
 
@@ -20,18 +21,23 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# --- Rate limit для /generate: 3 запити на IP за 24 години ---
-_rate_store: dict[str, list[float]] = {}
 RATE_LIMIT = 3
 RATE_WINDOW = 86400  # 24 години в секундах
 
-def check_rate_limit(ip: str):
-    now = time.time()
-    hits = [t for t in _rate_store.get(ip, []) if now - t < RATE_WINDOW]
-    if len(hits) >= RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again tomorrow.")
-    hits.append(now)
-    _rate_store[ip] = hits
+async def check_rate_limit(ip: str):
+    redis_url = os.environ.get("REDIS_URL", "")
+    if not redis_url:
+        return  # якщо Redis недоступний — пропускаємо (не ламаємо сервіс)
+    r = aioredis.from_url(redis_url, decode_responses=True)
+    try:
+        key = f"gen_rate:{ip}"
+        count = await r.incr(key)
+        if count == 1:
+            await r.expire(key, RATE_WINDOW)
+        if count > RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again tomorrow.")
+    finally:
+        await r.aclose()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = [int(x) for x in os.environ["ADMIN_IDS"].split(",") if x]
