@@ -1,4 +1,8 @@
 import os
+import json
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -6,7 +10,27 @@ import aiohttp
 import asyncpg
 import redis.asyncio as aioredis
 
-app = FastAPI()
+# ── Логування ────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ── Lifespan — пул створюється один раз при старті ───────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        raise RuntimeError("Missing required environment variable: DATABASE_URL")
+    logger.info("Creating DB connection pool")
+    app.state.pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
+    logger.info("DB pool ready")
+    yield
+    logger.info("Closing DB connection pool")
+    await app.state.pool.close()
+
+app = FastAPI(lifespan=lifespan)
 
 ALLOWED_ORIGINS = [
     "https://ceoinfiniteunion-cell.github.io",
@@ -22,12 +46,13 @@ app.add_middleware(
 )
 
 RATE_LIMIT = 3
-RATE_WINDOW = 86400  # 24 години в секундах
+RATE_WINDOW = 86400  # 24 години
 
 async def check_rate_limit(ip: str):
     redis_url = os.environ.get("REDIS_URL", "")
     if not redis_url:
-        return  # якщо Redis недоступний — пропускаємо (не ламаємо сервіс)
+        logger.warning("REDIS_URL not set — rate limit skipped")
+        return
     r = aioredis.from_url(redis_url, decode_responses=True)
     try:
         key = f"gen_rate:{ip}"
@@ -35,13 +60,13 @@ async def check_rate_limit(ip: str):
         if count == 1:
             await r.expire(key, RATE_WINDOW)
         if count > RATE_LIMIT:
+            logger.warning("Rate limit exceeded for IP %s (count=%d)", ip, count)
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again tomorrow.")
     finally:
         await r.aclose()
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = [int(x) for x in os.environ["ADMIN_IDS"].split(",") if x]
-DB_URL = os.environ["DATABASE_URL"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 
 class Lead(BaseModel):
     name: str
@@ -60,17 +85,23 @@ class Lead(BaseModel):
         return v.strip()
 
 async def notify_admins(text: str):
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set — cannot notify admins")
+        return
     async with aiohttp.ClientSession() as session:
         for admin_id in ADMIN_IDS:
-            await session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
-            )
+            try:
+                resp = await session.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
+                )
+                if resp.status != 200:
+                    logger.warning("TG notify failed for admin %s: status %d", admin_id, resp.status)
+            except Exception:
+                logger.exception("Failed to notify admin %s", admin_id)
 
-async def save_to_db(lead: "Lead") -> int:
-    from bot.database import get_pool
-    import json
-    pool = await get_pool()
+async def save_to_db(request: Request, lead: "Lead") -> int:
+    pool = request.app.state.pool
     async with pool.acquire() as conn:
         lead_id = await conn.fetchval(
             """INSERT INTO leads (user_id, username, name, service, budget, timeline, contact, extra)
@@ -91,19 +122,27 @@ async def save_to_db(lead: "Lead") -> int:
         return lead_id
 
 @app.post("/lead")
-async def receive_lead(lead: Lead):
-    lead_id = await save_to_db(lead)
-    text = (
-        f"🔔 <b>Нова заявка з сайту #{lead_id}</b>\n\n"
-        f"👤 Ім'я: {lead.name}\n"
-        f"📞 Телефон: {lead.phone or '—'}\n"
-        f"✈️ Telegram: {lead.contact}\n"
-        f"🏷 Тип проєкту: {lead.project_type or '—'}\n"
-        f"📝 Опис: {lead.project or '—'}\n"
-        f"💰 Бюджет: {lead.budget or '—'}\n"
-        f"📅 Дедлайн: {lead.deadline or '—'}"
-    )
-    await notify_admins(text)
+async def receive_lead(lead: Lead, request: Request):
+    try:
+        lead_id = await save_to_db(request, lead)
+        logger.info("Lead #%d saved (name=%s)", lead_id, lead.name)
+    except Exception:
+        logger.exception("Failed to save lead (name=%s)", lead.name)
+        raise HTTPException(status_code=500, detail="Failed to save lead")
+    try:
+        text = (
+            f"🔔 <b>Нова заявка з сайту #{lead_id}</b>\n\n"
+            f"👤 Ім'я: {lead.name}\n"
+            f"📞 Телефон: {lead.phone or '—'}\n"
+            f"✈️ Telegram: {lead.contact}\n"
+            f"🏷 Тип проєкту: {lead.project_type or '—'}\n"
+            f"📝 Опис: {lead.project or '—'}\n"
+            f"💰 Бюджет: {lead.budget or '—'}\n"
+            f"📅 Дедлайн: {lead.deadline or '—'}"
+        )
+        await notify_admins(text)
+    except Exception:
+        logger.exception("Failed to notify admins for lead #%d", lead_id)
     return {"ok": True}
 
 class GenerateRequest(BaseModel):
@@ -130,29 +169,34 @@ class GenerateRequest(BaseModel):
 @app.post("/generate")
 async def generate_site(req: GenerateRequest, request: Request):
     ip = request.client.host
-    check_rate_limit(ip)
-
+    await check_rate_limit(ip)
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
+        logger.error("ANTHROPIC_API_KEY not set")
         raise HTTPException(status_code=503, detail="Service unavailable")
-
+    logger.info("Generate request from IP %s", ip)
     async with aiohttp.ClientSession() as session:
-        resp = await session.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 4000,
-                "system": req.system,
-                "messages": [{"role": "user", "content": req.prompt}]
-            }
-        )
-        data = await resp.json()
-    return data
+        try:
+            resp = await session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 4000,
+                    "system": req.system,
+                    "messages": [{"role": "user", "content": req.prompt}]
+                }
+            )
+            data = await resp.json()
+            logger.info("Generate OK for IP %s", ip)
+            return data
+        except Exception:
+            logger.exception("Anthropic API call failed for IP %s", ip)
+            raise HTTPException(status_code=502, detail="AI service error")
 
 @app.get("/health")
 async def health():

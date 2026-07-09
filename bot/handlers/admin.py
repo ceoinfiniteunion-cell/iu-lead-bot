@@ -7,7 +7,9 @@ from bot.config import ADMIN_IDS
 from bot.keyboards.admin_kb import admin_main_kb, lead_kb
 from bot import database as db
 import aiohttp, os
+import logging
 
+logger = logging.getLogger(__name__)
 router = Router()
 BUH_BOT_TOKEN = os.environ.get("BUH_BOT_TOKEN", "")
 
@@ -109,17 +111,24 @@ async def lead_fill(cb: CallbackQuery, state: FSMContext):
             f"📅 Дедлайн: {extra.get('deadline','—')}"
         )
         buh_url = os.environ.get("BUH_API_URL", "")
-        async with aiohttp.ClientSession() as session:
-            await session.post(buh_url, json={
-                "name": lead.get("name","—"),
-                "contact": extra.get("tg_username", lead.get("contact","—")),
-                "phone": extra.get("phone","—"),
-                "project_type": extra.get("project_type", lead.get("service","—")),
-                "budget": extra.get("buh_budget", lead.get("budget","—")),
-                "deadline": extra.get("deadline","—"),
-                "project": lead.get("contact","—")
-            })
-        await cb.answer("✅ Відправлено в бухгалтерію!", show_alert=True)
+        try:
+            async with aiohttp.ClientSession() as session:
+                resp = await session.post(buh_url, json={
+                    "name": lead.get("name","—"),
+                    "contact": extra.get("tg_username", lead.get("contact","—")),
+                    "phone": extra.get("phone","—"),
+                    "project_type": extra.get("project_type", lead.get("service","—")),
+                    "budget": extra.get("buh_budget", lead.get("budget","—")),
+                    "deadline": extra.get("deadline","—"),
+                    "project": lead.get("contact","—")
+                })
+                if resp.status != 200:
+                    logger.warning("Buh API returned %d for lead #%d", resp.status, lead_id)
+            logger.info("Lead #%d sent to buh bot", lead_id)
+            await cb.answer("✅ Відправлено в бухгалтерію!", show_alert=True)
+        except Exception:
+            logger.exception("Failed to send lead #%d to buh bot", lead_id)
+            await cb.answer("❌ Помилка відправки в бухгалтерію", show_alert=True)
         return
 
     label = FIELD_LABELS.get(field, field)
