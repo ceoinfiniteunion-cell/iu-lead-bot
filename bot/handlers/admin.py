@@ -13,7 +13,12 @@ logger = logging.getLogger(__name__)
 router = Router()
 BUH_BOT_TOKEN = os.environ.get("BUH_BOT_TOKEN", "")
 
-def is_admin(uid): return uid in ADMIN_IDS
+def _is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+# Централізований фільтр — всі хендлери роутера автоматично перевіряють адміна
+router.message.filter(lambda m: _is_admin(m.from_user.id))
+router.callback_query.filter(lambda c: _is_admin(c.from_user.id))
 
 STATUS_UA = {"new":"🆕 Нова","in_progress":"🔄 В роботі","closed":"✅ Закрита"}
 
@@ -37,7 +42,6 @@ class AdminFill(StatesGroup):
 
 @router.message(Command("admin"))
 async def cmd_admin(msg: Message):
-    if not is_admin(msg.from_user.id): return
     stats = await db.get_stats()
     await msg.answer(
         "🎛 <b>Адмін-панель Infinite Union</b>\n\nВибери розділ:",
@@ -47,7 +51,6 @@ async def cmd_admin(msg: Message):
 
 @router.callback_query(F.data.startswith("al:"))
 async def leads_list(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return
     status = cb.data.split(":")[1]
     leads = await db.get_leads(status)
     if not leads:
@@ -63,7 +66,6 @@ async def leads_list(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ls:"))
 async def lead_set_status(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return
     _, lead_id, new_status = cb.data.split(":")
     lead_id = int(lead_id)
     await db.set_status(lead_id, new_status)
@@ -73,7 +75,6 @@ async def lead_set_status(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("lo:"))
 async def lead_open(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return
     lead_id = int(cb.data.split(":")[1])
     lead = dict(await db.get_lead(lead_id) or {})
     extra = await db.get_lead_extra(lead_id)
@@ -92,7 +93,6 @@ async def lead_open(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("lf:"))
 async def lead_fill(cb: CallbackQuery, state: FSMContext):
-    if not is_admin(cb.from_user.id): return
     parts = cb.data.split(":")
     lead_id, field = int(parts[1]), parts[2]
 
@@ -139,7 +139,6 @@ async def lead_fill(cb: CallbackQuery, state: FSMContext):
 
 @router.message(AdminFill.waiting)
 async def admin_fill_value(msg: Message, state: FSMContext):
-    if not is_admin(msg.from_user.id): return
     data = await state.get_data()
     lead_id = data["lead_id"]
     field = FIELD_KEYS.get(data["field"], data["field"])
@@ -163,7 +162,6 @@ async def admin_fill_value(msg: Message, state: FSMContext):
 
 @router.callback_query(F.data == "a:stats")
 async def admin_stats(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return
     s = await db.get_stats()
     await cb.message.edit_text(
         f"📊 <b>Статистика</b>\n\nВсього: <b>{s['total']}</b>\n🆕 {s['new']}\n🔄 {s['in_progress']}\n✅ {s['closed']}",
@@ -172,7 +170,6 @@ async def admin_stats(cb: CallbackQuery):
 
 @router.callback_query(F.data == "a:back")
 async def admin_back(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id): return
     stats = await db.get_stats()
     await cb.message.edit_text(
         "🎛 <b>Адмін-панель Infinite Union</b>\n\nВибери розділ:",

@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
+import html as html_lib
 import aiohttp
 import asyncpg
 import redis.asyncio as aioredis
@@ -107,11 +108,11 @@ async def save_to_db(request: Request, lead: "Lead") -> int:
         lead_id = await conn.fetchval(
             """INSERT INTO leads (user_id, username, name, service, budget, timeline, contact, extra)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
-            0, "site", lead.name,
-            lead.project_type or "З сайту",
-            lead.budget or "—",
+            0, "site", html_lib.escape(lead.name),
+            html_lib.escape(lead.project_type or "З сайту"),
+            html_lib.escape(lead.budget or "—"),
             "—",
-            lead.contact,
+            html_lib.escape(lead.contact),
             json.dumps({
                 "phone": lead.phone,
                 "tg_username": lead.contact,
