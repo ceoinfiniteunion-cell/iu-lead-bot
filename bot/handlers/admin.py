@@ -53,7 +53,11 @@ async def leads_list(cb: CallbackQuery):
     text = f"<b>{STATUS_UA.get(status)} заявки:</b>\n\n"
     for l in leads:
         text += f"#{l['id']} | {l['name']} | {l['service']}\n📞 {l['contact']} | 💵 {l['budget']}\n🕐 {l['created_at'].strftime('%d.%m %H:%M')}\n\n"
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=lead_kb(0, status))
+    # Кнопки для кожної заявки
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    rows = [[InlineKeyboardButton(text=f"#{l['id']} {l['name']}", callback_data=f"lo:{l['id']}")] for l in leads]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="a:back")])
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("ls:"))
 async def lead_set_status(cb: CallbackQuery):
@@ -63,6 +67,26 @@ async def lead_set_status(cb: CallbackQuery):
     await db.set_status(lead_id, new_status)
     await cb.answer(f"Статус → {STATUS_UA.get(new_status)}", show_alert=True)
     await cb.message.edit_reply_markup(reply_markup=lead_kb(lead_id, new_status))
+
+
+@router.callback_query(F.data.startswith("lo:"))
+async def lead_open(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    lead_id = int(cb.data.split(":")[1])
+    lead = dict(await db.get_lead(lead_id) or {})
+    extra = await db.get_lead_extra(lead_id)
+    text = (
+        f"📋 <b>Заявка #{lead_id}</b>\n\n"
+        f"👤 {lead.get('name','—')}\n"
+        f"📞 {extra.get('phone', lead.get('contact','—'))}\n"
+        f"✈️ {extra.get('tg_username','—')}\n"
+        f"🏷 {extra.get('project_type', lead.get('service','—'))}\n"
+        f"📝 {lead.get('contact','—')}\n"
+        f"💰 {extra.get('buh_budget', lead.get('budget','—'))}\n"
+        f"📅 {extra.get('deadline','—')}\n"
+        f"🕐 {lead.get('created_at').strftime('%d.%m %H:%M') if lead.get('created_at') else '—'}"
+    )
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=lead_kb(lead_id, lead.get("status","new")))
 
 @router.callback_query(F.data.startswith("lf:"))
 async def lead_fill(cb: CallbackQuery, state: FSMContext):
