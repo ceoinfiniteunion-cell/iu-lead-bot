@@ -21,6 +21,10 @@ DB_URL = os.environ["DATABASE_URL"]
 class Lead(BaseModel):
     name: str
     contact: str
+    phone: str = ""
+    project_type: str = ""
+    budget: str = ""
+    deadline: str = ""
     project: str = ""
 
     @field_validator("name", "contact")
@@ -38,13 +42,18 @@ async def notify_admins(text: str):
                 json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
             )
 
-async def save_to_db(name: str, contact: str, project: str) -> int:
+async def save_to_db(lead: "Lead") -> int:
     conn = await asyncpg.connect(DB_URL)
     try:
         lead_id = await conn.fetchval(
-            """INSERT INTO leads (user_id, username, name, service, budget, timeline, contact)
-               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
-            0, "site", name, project or "З сайту", "—", "—", contact
+            """INSERT INTO leads (user_id, username, name, service, budget, timeline, contact, extra)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
+            0, "site", lead.name,
+            lead.project_type or "З сайту",
+            lead.budget or "—",
+            "—",
+            lead.contact,
+            f'{{"phone":"{lead.phone}","tg_username":"{lead.contact}","project_type":"{lead.project_type}","buh_budget":"{lead.budget}","deadline":"{lead.deadline}"}}'
         )
         return lead_id
     finally:
@@ -52,12 +61,16 @@ async def save_to_db(name: str, contact: str, project: str) -> int:
 
 @app.post("/lead")
 async def receive_lead(lead: Lead):
-    lead_id = await save_to_db(lead.name, lead.contact, lead.project)
+    lead_id = await save_to_db(lead)
     text = (
         f"🔔 <b>Нова заявка з сайту #{lead_id}</b>\n\n"
         f"👤 Ім'я: {lead.name}\n"
-        f"📞 Контакт: {lead.contact}\n"
-        f"💬 Проект: {lead.project or '—'}"
+        f"📞 Телефон: {lead.phone or '—'}\n"
+        f"✈️ Telegram: {lead.contact}\n"
+        f"🏷 Тип проєкту: {lead.project_type or '—'}\n"
+        f"📝 Опис: {lead.project or '—'}\n"
+        f"💰 Бюджет: {lead.budget or '—'}\n"
+        f"📅 Дедлайн: {lead.deadline or '—'}"
     )
     await notify_admins(text)
     return {"ok": True}
