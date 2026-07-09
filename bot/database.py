@@ -78,5 +78,12 @@ async def get_lead_extra(lead_id: int) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT extra FROM leads WHERE id = $1", lead_id)
         if row and row["extra"]:
-            return dict(row["extra"])
+            val = row["extra"]
+            if isinstance(val, dict):
+                return val
+            import json
+            try:
+                return json.loads(val)
+            except Exception:
+                return {}
         return {}
