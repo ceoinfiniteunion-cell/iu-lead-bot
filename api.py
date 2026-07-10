@@ -48,7 +48,7 @@ DLQ_KEY = "dlq:leads"
 
 async def dlq_push(r: aioredis.Redis, lead_data: dict):
     try:
-        await r.rpush(DLQ_KEY, json.dumps(lead_data))
+        await r.rpush(DLQ_KEY, json.dumps(lead_data))  # type: ignore[misc]
         logger.warning("[DLQ] Lead pushed to dead letter queue: %s", lead_data.get("name"))
     except Exception:
         logger.exception("[DLQ] Failed to push to DLQ — lead LOST: %s", lead_data)
@@ -58,7 +58,7 @@ async def dlq_worker(pool: asyncpg.Pool, r: aioredis.Redis):
     import html as html_lib
     while True:
         try:
-            item = await r.lpop(DLQ_KEY)
+            item = await r.lpop(DLQ_KEY)  # type: ignore[misc]
             if not item:
                 await asyncio.sleep(30)
                 continue
@@ -116,8 +116,8 @@ async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
 
     from bot.database import init_db, init_audit_and_idempotency
-    await init_db()
-    await init_audit_and_idempotency()
+    await init_db()  # type: ignore[misc]
+    await init_audit_and_idempotency()  # type: ignore[misc]
     logger.info("DB pool ready")
 
     # Graceful shutdown
@@ -304,7 +304,7 @@ async def save_to_db(pool: asyncpg.Pool, lead: Lead) -> int:
 # ── Endpoints ─────────────────────────────────────────────────────────
 @app.post("/lead")
 async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
-    ip = request.client.host
+    ip = request.client.host if request.client else "unknown"
 
     if lead.website:
         logger.warning("[SECURITY] Honeypot triggered from IP %s", ip)
@@ -371,7 +371,7 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
 
 @app.post("/generate")
 async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
-    ip = request.client.host
+    ip = request.client.host if request.client else "unknown"
 
     if cb_is_open():
         logger.warning("[CIRCUIT_BREAKER] Request blocked for IP %s", ip)
@@ -419,7 +419,7 @@ async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
 
 @app.get("/health")
 async def health(request: Request):
-    status = {
+    status: dict[str, object] = {
         "status": "ok",
         "db": "unknown",
         "redis": "unknown",
@@ -444,7 +444,7 @@ async def health(request: Request):
         redis_url = os.environ.get("REDIS_URL", "")
         if redis_url:
             r = aioredis.from_url(redis_url, decode_responses=True)
-            await r.ping()
+            await r.ping()  # type: ignore[misc]
             dlq_size = await r.llen(DLQ_KEY)
             await r.aclose()
             status["redis"] = "ok"
