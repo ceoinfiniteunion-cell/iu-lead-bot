@@ -303,12 +303,26 @@ async def save_to_db(pool: asyncpg.Pool, lead: Lead) -> int:
 
 # ── Endpoints ─────────────────────────────────────────────────────────
 @app.post("/lead")
-async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
+async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep):
     ip = request.client.host if request.client else "unknown"
 
     if lead.website:
         logger.warning("[SECURITY] Honeypot triggered from IP %s", ip)
         return {"ok": True}
+
+    # Rate-limit на /lead: 10 заявок з одного IP за 24 години
+    try:
+        lead_key = f"lead_rate:{ip}"
+        lead_count = await r.incr(lead_key)
+        if lead_count == 1:
+            await r.expire(lead_key, 86400)
+        if lead_count > 10:
+            logger.warning("[SECURITY] Lead rate limit exceeded for IP %s (count=%d)", ip, lead_count)
+            return {"ok": True}  # тихо ігноруємо, не розкриваємо ліміт
+    except Exception:
+        logger.exception("[SECURITY] Redis error on lead rate-limit for IP %s", ip)
+    finally:
+        await r.aclose()
 
     # Idempotency check
     if lead.idempotency_key:
