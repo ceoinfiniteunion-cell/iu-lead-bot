@@ -87,3 +87,29 @@ async def get_lead_extra(lead_id: int) -> dict:
             except Exception:
                 return {}
         return {}
+
+
+async def init_audit_and_idempotency():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id         SERIAL PRIMARY KEY,
+                event      TEXT NOT NULL,
+                ip         TEXT,
+                payload    JSONB DEFAULT '{}',
+                result     TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key        TEXT PRIMARY KEY,
+                lead_id    INTEGER,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_idempotency_created
+            ON idempotency_keys (created_at)
+        """)
