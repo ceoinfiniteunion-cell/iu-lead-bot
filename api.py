@@ -52,8 +52,10 @@ RATE_WINDOW = 86400  # 24 години
 async def check_rate_limit(ip: str):
     redis_url = os.environ.get("REDIS_URL", "")
     if not redis_url:
-        logger.warning("REDIS_URL not set — rate limit skipped")
-        return
+        # Redis недоступний — блокуємо за принципом Defense in Depth
+        # Краще відмовити ніж пропустити без перевірки
+        logger.error("REDIS_URL not set — blocking /generate (Defense in Depth)")
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
     r = aioredis.from_url(redis_url, decode_responses=True)
     try:
         key = f"gen_rate:{ip}"
@@ -61,8 +63,13 @@ async def check_rate_limit(ip: str):
         if count == 1:
             await r.expire(key, RATE_WINDOW)
         if count > RATE_LIMIT:
-            logger.warning("Rate limit exceeded for IP %s (count=%d)", ip, count)
+            logger.warning("[SECURITY] Rate limit exceeded for IP %s (count=%d)", ip, count)
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again tomorrow.")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("[SECURITY] Redis error for IP %s — blocking request", ip)
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
     finally:
         await r.aclose()
 
@@ -78,6 +85,13 @@ class Lead(BaseModel):
     deadline: str = ""
     project: str = ""
     website: str = ""  # honeypot
+
+    @field_validator("project")
+    @classmethod
+    def project_max_length(cls, v: str) -> str:
+        if len(v) > 2000:
+            raise ValueError("project description too long (max 2000 chars)")
+        return v
 
     @field_validator("name", "contact")
     @classmethod
@@ -126,7 +140,7 @@ async def save_to_db(request: Request, lead: "Lead") -> int:
 @app.post("/lead")
 async def receive_lead(lead: Lead, request: Request):
     if lead.website:
-        logger.warning("Honeypot triggered from IP %s", request.client.host)
+        logger.warning("[SECURITY] Honeypot triggered from IP %s — bot rejected", request.client.host)
         return {"ok": True}  # тихо ігноруємо бота
     try:
         lead_id = await save_to_db(request, lead)
