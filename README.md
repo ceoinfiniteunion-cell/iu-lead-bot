@@ -53,3 +53,12 @@ python -m bot.main
 ```bash
 pytest tests/ -v
 ```
+
+## Domain & Deployment
+
+- **Bot API**: deployed on [Railway](https://railway.app) — project `brave-renewal`
+- **Website**: currently on GitHub Pages (`ceoinfiniteunion-cell.github.io/iuwebsite`)
+- **Production domain**: `infiniteunion.com.ua` — DNS migration in progress
+
+> Note: canonical URL in `index.html` already points to `infiniteunion.com.ua`.
+> GitHub Pages will be replaced with the production domain shortly.
