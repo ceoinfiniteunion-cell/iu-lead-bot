@@ -4,6 +4,8 @@ import time
 import hmac
 import hashlib
 import logging
+import asyncio
+import signal
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -20,11 +22,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Circuit breaker state ─────────────────────────────────────────────
+# ── Circuit breaker ───────────────────────────────────────────────────
 _cb_failures = 0
 _cb_open_until = 0.0
 CB_THRESHOLD = 3
-CB_TIMEOUT = 60  # секунд
+CB_TIMEOUT = 60
 
 def cb_is_open() -> bool:
     return time.time() < _cb_open_until
@@ -34,12 +36,74 @@ def cb_record_failure():
     _cb_failures += 1
     if _cb_failures >= CB_THRESHOLD:
         _cb_open_until = time.time() + CB_TIMEOUT
-        logger.warning("[CIRCUIT_BREAKER] Opened — Anthropic API failing, blocking for %ds", CB_TIMEOUT)
+        logger.warning("[CIRCUIT_BREAKER] Opened — blocking for %ds", CB_TIMEOUT)
 
 def cb_record_success():
     global _cb_failures, _cb_open_until
     _cb_failures = 0
     _cb_open_until = 0.0
+
+# ── Dead letter queue ─────────────────────────────────────────────────
+DLQ_KEY = "dlq:leads"
+
+async def dlq_push(r: aioredis.Redis, lead_data: dict):
+    try:
+        await r.rpush(DLQ_KEY, json.dumps(lead_data))
+        logger.warning("[DLQ] Lead pushed to dead letter queue: %s", lead_data.get("name"))
+    except Exception:
+        logger.exception("[DLQ] Failed to push to DLQ — lead LOST: %s", lead_data)
+
+async def dlq_worker(pool: asyncpg.Pool, r: aioredis.Redis):
+    """Фоновий worker — ретраїть ліди з DLQ."""
+    import html as html_lib
+    while True:
+        try:
+            item = await r.lpop(DLQ_KEY)
+            if not item:
+                await asyncio.sleep(30)
+                continue
+            data = json.loads(item)
+            logger.info("[DLQ] Retrying lead: %s", data.get("name"))
+            async with pool.acquire() as conn:
+                lead_id = await conn.fetchval(
+                    """INSERT INTO leads (user_id, username, name, service, budget, timeline, contact, extra)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
+                    0, "dlq_retry",
+                    html_lib.escape(data.get("name", "")),
+                    html_lib.escape(data.get("project_type") or "З сайту"),
+                    html_lib.escape(data.get("budget") or "—"),
+                    "—",
+                    html_lib.escape(data.get("contact", "")),
+                    json.dumps(data)
+                )
+            logger.info("[DLQ] Lead #%d recovered from DLQ", lead_id)
+        except Exception:
+            logger.exception("[DLQ] Worker error")
+            await asyncio.sleep(10)
+
+# ── Pool monitor ──────────────────────────────────────────────────────
+async def pool_monitor(pool: asyncpg.Pool):
+    """Логує стан пулу кожні 30 секунд."""
+    while True:
+        try:
+            size = pool.get_size()
+            idle = pool.get_idle_size()
+            used = size - idle
+            pct = (used / size * 100) if size else 0
+            if pct >= 80:
+                logger.warning("[POOL] High usage: %d/%d connections (%.0f%%)", used, size, pct)
+            else:
+                logger.info("[POOL] %d/%d connections used (%.0f%%)", used, size, pct)
+        except Exception:
+            logger.exception("[POOL] Monitor error")
+        await asyncio.sleep(30)
+
+# ── Graceful shutdown ─────────────────────────────────────────────────
+_shutdown_event = asyncio.Event()
+
+def handle_sigterm():
+    logger.info("[SHUTDOWN] SIGTERM received — starting graceful shutdown")
+    _shutdown_event.set()
 
 # ── Lifespan ──────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -47,14 +111,40 @@ async def lifespan(app: FastAPI):
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
         raise RuntimeError("Missing required environment variable: DATABASE_URL")
+
     logger.info("Creating DB connection pool")
     app.state.pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
+
     from bot.database import init_db, init_audit_and_idempotency
     await init_db()
     await init_audit_and_idempotency()
     logger.info("DB pool ready")
+
+    # Graceful shutdown
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
+
+    # Фонові задачі
+    redis_url = os.environ.get("REDIS_URL", "")
+    background_tasks = []
+    if redis_url:
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        background_tasks.append(asyncio.create_task(dlq_worker(app.state.pool, r)))
+        logger.info("DLQ worker started")
+
+    background_tasks.append(asyncio.create_task(pool_monitor(app.state.pool)))
+    logger.info("Pool monitor started")
+
     yield
+
+    # Shutdown
+    logger.info("[SHUTDOWN] Stopping background tasks")
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
+    logger.info("[SHUTDOWN] Closing DB pool")
     await app.state.pool.close()
+    logger.info("[SHUTDOWN] Done")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -89,31 +179,7 @@ async def get_redis() -> aioredis.Redis:
 PoolDep = Annotated[asyncpg.Pool, Depends(get_pool)]
 RedisDep = Annotated[aioredis.Redis, Depends(get_redis)]
 
-# ── Security helpers ──────────────────────────────────────────────────
-async def verify_signature(request: Request):
-    """HMAC request signing — replay attack protection."""
-    if not SIGNING_SECRET:
-        return  # якщо секрет не задано — пропускаємо (backward compat)
-    sig = request.headers.get("X-Signature", "")
-    ts = request.headers.get("X-Timestamp", "")
-    if not sig or not ts:
-        raise HTTPException(status_code=401, detail="Missing signature")
-    try:
-        ts_int = int(ts)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid timestamp")
-    if abs(time.time() - ts_int) > 300:  # 5 хвилин вікно
-        raise HTTPException(status_code=401, detail="Request expired")
-    body = await request.body()
-    expected = hmac.new(
-        SIGNING_SECRET.encode(),
-        f"{ts}:{body.decode()}".encode(),
-        hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        logger.warning("[SECURITY] Invalid signature from IP %s", request.client.host)
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
+# ── Security ──────────────────────────────────────────────────────────
 async def check_rate_limit(ip: str, r: aioredis.Redis):
     try:
         key = f"gen_rate:{ip}"
@@ -121,12 +187,12 @@ async def check_rate_limit(ip: str, r: aioredis.Redis):
         if count == 1:
             await r.expire(key, RATE_WINDOW)
         if count > RATE_LIMIT:
-            logger.warning("[SECURITY] Rate limit exceeded for IP %s (count=%d)", ip, count)
+            logger.warning("[SECURITY] Rate limit exceeded IP %s (count=%d)", ip, count)
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again tomorrow.")
     except HTTPException:
         raise
     except Exception:
-        logger.exception("[SECURITY] Redis error for IP %s — blocking", ip)
+        logger.exception("[SECURITY] Redis error IP %s — blocking", ip)
         raise HTTPException(status_code=503, detail="Service temporarily unavailable")
 
 async def audit(pool: asyncpg.Pool, event: str, ip: str, payload: dict, result: str):
@@ -187,21 +253,32 @@ class GenerateRequest(BaseModel):
         return v
 
 # ── Helpers ───────────────────────────────────────────────────────────
-async def notify_admins(text: str):
+async def notify_admins_with_backoff(text: str, max_retries: int = 3):
+    """Exponential backoff на Telegram notify."""
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set")
         return
-    async with aiohttp.ClientSession() as session:
-        for admin_id in ADMIN_IDS:
+    for admin_id in ADMIN_IDS:
+        for attempt in range(max_retries):
             try:
-                resp = await session.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
-                )
-                if resp.status != 200:
-                    logger.warning("TG notify failed for admin %s: %d", admin_id, resp.status)
+                async with aiohttp.ClientSession() as session:
+                    resp = await session.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"}
+                    )
+                    if resp.status == 200:
+                        break
+                    logger.warning("TG notify attempt %d failed for admin %s: %d",
+                                   attempt + 1, admin_id, resp.status)
             except Exception:
-                logger.exception("Failed to notify admin %s", admin_id)
+                logger.exception("TG notify attempt %d exception for admin %s",
+                                 attempt + 1, admin_id)
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.info("Retrying admin %s notify in %ds", admin_id, wait)
+                await asyncio.sleep(wait)
+        else:
+            logger.error("Failed to notify admin %s after %d attempts", admin_id, max_retries)
 
 async def save_to_db(pool: asyncpg.Pool, lead: Lead) -> int:
     import html as html_lib
@@ -229,12 +306,11 @@ async def save_to_db(pool: asyncpg.Pool, lead: Lead) -> int:
 async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
     ip = request.client.host
 
-    # Honeypot
     if lead.website:
         logger.warning("[SECURITY] Honeypot triggered from IP %s", ip)
         return {"ok": True}
 
-    # Idempotency
+    # Idempotency check
     if lead.idempotency_key:
         async with pool.acquire() as conn:
             existing = await conn.fetchval(
@@ -242,7 +318,7 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
                 lead.idempotency_key
             )
             if existing:
-                logger.info("Duplicate lead rejected (idempotency_key=%s)", lead.idempotency_key)
+                logger.info("Duplicate lead rejected (key=%s)", lead.idempotency_key)
                 return {"ok": True, "lead_id": existing}
 
     try:
@@ -251,9 +327,19 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
     except Exception:
         logger.exception("Failed to save lead (name=%s)", lead.name)
         await audit(pool, "lead_save_failed", ip, {"name": lead.name}, "error")
+        # Dead letter queue — не втрачаємо ліда
+        redis_url = os.environ.get("REDIS_URL", "")
+        if redis_url:
+            r = aioredis.from_url(redis_url, decode_responses=True)
+            await dlq_push(r, {
+                "name": lead.name, "contact": lead.contact,
+                "phone": lead.phone, "project_type": lead.project_type,
+                "budget": lead.budget, "deadline": lead.deadline,
+                "project": lead.project
+            })
+            await r.aclose()
         raise HTTPException(status_code=500, detail="Failed to save lead")
 
-    # Зберігаємо idempotency key
     if lead.idempotency_key:
         try:
             async with pool.acquire() as conn:
@@ -277,7 +363,7 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep):
             f"💰 Бюджет: {lead.budget or '—'}\n"
             f"📅 Дедлайн: {lead.deadline or '—'}"
         )
-        await notify_admins(text)
+        await notify_admins_with_backoff(text)
     except Exception:
         logger.exception("Failed to notify admins for lead #%d", lead_id)
 
@@ -333,35 +419,43 @@ async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
 
 @app.get("/health")
 async def health(request: Request):
-    status = {"status": "ok", "db": "unknown", "redis": "unknown"}
+    status = {
+        "status": "ok",
+        "db": "unknown",
+        "redis": "unknown",
+        "circuit_breaker": "open" if cb_is_open() else "closed",
+        "cb_failures": _cb_failures,
+    }
 
-    # DB check
     try:
         pool = request.app.state.pool
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
+        size = pool.get_size()
+        idle = pool.get_idle_size()
         status["db"] = "ok"
+        status["db_pool"] = {"size": size, "idle": idle, "used": size - idle}
     except Exception:
         status["db"] = "error"
         status["status"] = "degraded"
         logger.error("Health check: DB unavailable")
 
-    # Redis check
     try:
         redis_url = os.environ.get("REDIS_URL", "")
         if redis_url:
             r = aioredis.from_url(redis_url, decode_responses=True)
             await r.ping()
+            dlq_size = await r.llen(DLQ_KEY)
             await r.aclose()
             status["redis"] = "ok"
+            status["dlq_size"] = dlq_size
+            if dlq_size > 0:
+                logger.warning("[DLQ] %d leads pending in queue", dlq_size)
         else:
             status["redis"] = "not_configured"
     except Exception:
         status["redis"] = "error"
         status["status"] = "degraded"
         logger.error("Health check: Redis unavailable")
-
-    # Circuit breaker status
-    status["circuit_breaker"] = "open" if cb_is_open() else "closed"
 
     return status
