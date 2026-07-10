@@ -17,7 +17,8 @@ async def test_health():
 
 @pytest.mark.asyncio
 async def test_lead_valid():
-    with patch("api.notify_admins", new_callable=AsyncMock):
+    with patch("api.notify_admins", new_callable=AsyncMock), \
+         patch("api.save_to_db", new_callable=AsyncMock, return_value=1):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             r = await ac.post("/lead", json={"name": "Єгор", "contact": "@test", "project": "Сайт"})
     assert r.status_code == 200
