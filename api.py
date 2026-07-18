@@ -5,6 +5,9 @@ import logging
 import asyncio
 import signal
 import html as html_lib
+import hmac
+import hashlib
+import time as time_module
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -112,6 +115,11 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Missing required environment variable: DATABASE_URL")
 
     logger.info("Creating DB connection pool")
+    redis_url = os.environ.get("REDIS_URL", "")
+    if not redis_url:
+        raise RuntimeError("REDIS_URL is not set")
+    app.state.redis = aioredis.from_url(redis_url, decode_responses=True)
+    logger.info("Redis pool ready")
     app.state.pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
 
     from bot.database import init_db, init_audit_and_idempotency
@@ -126,9 +134,7 @@ async def lifespan(app: FastAPI):
     # Фонові задачі
     redis_url = os.environ.get("REDIS_URL", "")
     background_tasks = []
-    if redis_url:
-        r = aioredis.from_url(redis_url, decode_responses=True)
-        background_tasks.append(asyncio.create_task(dlq_worker(app.state.pool, r)))
+    background_tasks.append(asyncio.create_task(dlq_worker(app.state.pool, app.state.redis)))
         logger.info("DLQ worker started")
 
     background_tasks.append(asyncio.create_task(pool_monitor(app.state.pool)))
@@ -141,6 +147,8 @@ async def lifespan(app: FastAPI):
     for task in background_tasks:
         task.cancel()
     await asyncio.gather(*background_tasks, return_exceptions=True)
+    logger.info("[SHUTDOWN] Closing Redis pool")
+    await app.state.redis.aclose()
     logger.info("[SHUTDOWN] Closing DB pool")
     await app.state.pool.close()
     logger.info("[SHUTDOWN] Done")
@@ -168,16 +176,32 @@ RATE_WINDOW = 86400
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 SIGNING_SECRET = os.environ.get("SIGNING_SECRET", "")
+SIGNATURE_MAX_AGE = 300  # 5 хвилин
+
+def verify_signature(body: bytes, signature: str, timestamp: str) -> bool:
+    """Перевіряє HMAC-SHA256 підпис запиту з фронтенду."""
+    if not SIGNING_SECRET or not signature or not timestamp:
+        return not SIGNING_SECRET  # якщо секрет не налаштований — пропускаємо
+    try:
+        ts = int(timestamp)
+        if abs(time_module.time() - ts) > SIGNATURE_MAX_AGE:
+            logger.warning("[SECURITY] Signature timestamp too old: %s", timestamp)
+            return False
+        expected = hmac.new(
+            SIGNING_SECRET.encode(),
+            f"{timestamp}.".encode() + body,
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    except Exception:
+        return False
 
 # ── Dependencies ──────────────────────────────────────────────────────
 async def get_pool(request: Request) -> asyncpg.Pool:
     return request.app.state.pool
 
-async def get_redis() -> aioredis.Redis:
-    redis_url = os.environ.get("REDIS_URL", "")
-    if not redis_url:
-        raise HTTPException(status_code=503, detail="Cache unavailable")
-    return aioredis.from_url(redis_url, decode_responses=True)
+async def get_redis(request: Request) -> aioredis.Redis:
+    return request.app.state.redis
 
 PoolDep = Annotated[asyncpg.Pool, Depends(get_pool)]
 RedisDep = Annotated[aioredis.Redis, Depends(get_redis)]
@@ -318,6 +342,15 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep)
         logger.warning("[SECURITY] Honeypot triggered from IP %s", ip)
         return {"ok": True}
 
+    # HMAC підпис — перевіряємо якщо SIGNING_SECRET налаштований
+    if SIGNING_SECRET:
+        sig = request.headers.get("X-Signature", "")
+        ts = request.headers.get("X-Timestamp", "")
+        body = await request.body()
+        if not verify_signature(body, sig, ts):
+            logger.warning("[SECURITY] Invalid signature from IP %s", ip)
+            raise HTTPException(status_code=403, detail="Invalid signature")
+
     # Rate-limit на /lead: 10 заявок з одного IP за 24 години
     try:
         lead_key = f"lead_rate:{ip}"
@@ -350,10 +383,7 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep)
         logger.exception("Failed to save lead (name=%s)", lead.name)
         await audit(pool, "lead_save_failed", ip, {"name": lead.name}, "error")
         # Dead letter queue — не втрачаємо ліда
-        redis_url = os.environ.get("REDIS_URL", "")
-        if redis_url:
-            r = aioredis.from_url(redis_url, decode_responses=True)
-            await dlq_push(r, {
+        await dlq_push(request.app.state.redis, {
                 "name": lead.name, "contact": lead.contact,
                 "phone": lead.phone, "project_type": lead.project_type,
                 "budget": lead.budget, "deadline": lead.deadline,
@@ -400,6 +430,15 @@ async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
         or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
         or (request.client.host if request.client else "unknown")
     )
+
+    # HMAC підпис — перевіряємо якщо SIGNING_SECRET налаштований
+    if SIGNING_SECRET:
+        sig = request.headers.get("X-Signature", "")
+        ts = request.headers.get("X-Timestamp", "")
+        body = await request.body()
+        if not verify_signature(body, sig, ts):
+            logger.warning("[SECURITY] Invalid signature from IP %s", ip)
+            raise HTTPException(status_code=403, detail="Invalid signature")
 
     if cb_is_open():
         logger.warning("[CIRCUIT_BREAKER] Request blocked for IP %s", ip)
@@ -474,12 +513,9 @@ async def health(request: Request):
         logger.error("Health check: DB unavailable")
 
     try:
-        redis_url = os.environ.get("REDIS_URL", "")
-        if redis_url:
-            r = aioredis.from_url(redis_url, decode_responses=True)
-            await r.ping()  # type: ignore[misc]
-            dlq_size = await r.llen(DLQ_KEY)
-            await r.aclose()
+        r = request.app.state.redis
+        await r.ping()  # type: ignore[misc]
+        dlq_size = await r.llen(DLQ_KEY)
             status["redis"] = "ok"
             status["dlq_size"] = dlq_size
             if dlq_size > 0:
