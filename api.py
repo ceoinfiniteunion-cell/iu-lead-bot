@@ -149,6 +149,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 ALLOWED_ORIGINS = [
+    "https://infiniteunion.com.ua",
+    "https://www.infiniteunion.com.ua",
     "https://ceoinfiniteunion-cell.github.io",
     "http://localhost:3000",
     "http://127.0.0.1:5500",
