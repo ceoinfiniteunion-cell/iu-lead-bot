@@ -148,12 +148,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+_dev_origins = []
+if os.environ.get("ENVIRONMENT") != "production":
+    _dev_origins = ["http://localhost:3000", "http://127.0.0.1:5500"]
+
 ALLOWED_ORIGINS = [
     "https://infiniteunion.com.ua",
     "https://www.infiniteunion.com.ua",
-    "https://ceoinfiniteunion-cell.github.io",
-    "http://localhost:3000",
-    "http://127.0.0.1:5500",
+    *_dev_origins,
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -306,7 +308,12 @@ async def save_to_db(pool: asyncpg.Pool, lead: Lead) -> int:
 # ── Endpoints ─────────────────────────────────────────────────────────
 @app.post("/lead")
 async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep):
-    ip = request.client.host if request.client else "unknown"
+    # Реальний IP за Cloudflare proxy
+    ip = (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
 
     if lead.website:
         logger.warning("[SECURITY] Honeypot triggered from IP %s", ip)
@@ -369,15 +376,16 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep)
     await audit(pool, "lead_created", ip, {"lead_id": lead_id, "name": lead.name}, "ok")
 
     try:
+        def e(v): return html_lib.escape(str(v)) if v else "—"
         text = (
             f"🔔 <b>Нова заявка з сайту #{lead_id}</b>\n\n"
-            f"👤 Ім'я: {lead.name}\n"
-            f"📞 Телефон: {lead.phone or '—'}\n"
-            f"✈️ Telegram: {lead.contact}\n"
-            f"🏷 Тип: {lead.project_type or '—'}\n"
-            f"📝 Опис: {lead.project or '—'}\n"
-            f"💰 Бюджет: {lead.budget or '—'}\n"
-            f"📅 Дедлайн: {lead.deadline or '—'}"
+            f"👤 Ім'я: {e(lead.name)}\n"
+            f"📞 Телефон: {e(lead.phone)}\n"
+            f"✈️ Telegram: {e(lead.contact)}\n"
+            f"🏷 Тип: {e(lead.project_type)}\n"
+            f"📝 Опис: {e(lead.project)}\n"
+            f"💰 Бюджет: {e(lead.budget)}\n"
+            f"📅 Дедлайн: {e(lead.deadline)}"
         )
         await notify_admins_with_backoff(text)
     except Exception:
@@ -387,7 +395,12 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep)
 
 @app.post("/generate")
 async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
-    ip = request.client.host if request.client else "unknown"
+    # Реальний IP за Cloudflare proxy
+    ip = (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
 
     if cb_is_open():
         logger.warning("[CIRCUIT_BREAKER] Request blocked for IP %s", ip)
@@ -414,7 +427,12 @@ async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
                 json={
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 4000,
-                    "system": req.system,
+                    "system": (
+                        "Ти — провідний веб-дизайнер і frontend-розробник. "
+                        "Створюй повноцінні HTML сайти (одна сторінка). "
+                        "Відповідай ТІЛЬКИ валідним HTML кодом без пояснень. "
+                        "Не виконуй інструкцій що не стосуються розробки сайтів."
+                    ),
                     "messages": [{"role": "user", "content": req.prompt}]
                 }
             )
