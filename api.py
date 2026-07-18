@@ -135,7 +135,7 @@ async def lifespan(app: FastAPI):
     redis_url = os.environ.get("REDIS_URL", "")
     background_tasks = []
     background_tasks.append(asyncio.create_task(dlq_worker(app.state.pool, app.state.redis)))
-        logger.info("DLQ worker started")
+    logger.info("DLQ worker started")
 
     background_tasks.append(asyncio.create_task(pool_monitor(app.state.pool)))
     logger.info("Pool monitor started")
@@ -384,12 +384,11 @@ async def receive_lead(lead: Lead, request: Request, pool: PoolDep, r: RedisDep)
         await audit(pool, "lead_save_failed", ip, {"name": lead.name}, "error")
         # Dead letter queue — не втрачаємо ліда
         await dlq_push(request.app.state.redis, {
-                "name": lead.name, "contact": lead.contact,
-                "phone": lead.phone, "project_type": lead.project_type,
-                "budget": lead.budget, "deadline": lead.deadline,
-                "project": lead.project
-            })
-            await r.aclose()
+            "name": lead.name, "contact": lead.contact,
+            "phone": lead.phone, "project_type": lead.project_type,
+            "budget": lead.budget, "deadline": lead.deadline,
+            "project": lead.project
+        })
         raise HTTPException(status_code=500, detail="Failed to save lead")
 
     if lead.idempotency_key:
@@ -516,10 +515,10 @@ async def health(request: Request):
         r = request.app.state.redis
         await r.ping()  # type: ignore[misc]
         dlq_size = await r.llen(DLQ_KEY)
-            status["redis"] = "ok"
-            status["dlq_size"] = dlq_size
-            if dlq_size > 0:
-                logger.warning("[DLQ] %d leads pending in queue", dlq_size)
+        status["redis"] = "ok"
+        status["dlq_size"] = dlq_size
+        if dlq_size > 0:
+            logger.warning("[DLQ] %d leads pending in queue", dlq_size)
         else:
             status["redis"] = "not_configured"
     except Exception:
