@@ -6,6 +6,7 @@ import hashlib
 import logging
 import asyncio
 import signal
+import html as html_lib
 from contextlib import asynccontextmanager
 from typing import Annotated
 
