@@ -1,8 +1,6 @@
 import os
 import json
 import time
-import hmac
-import hashlib
 import logging
 import asyncio
 import signal

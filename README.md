@@ -26,7 +26,7 @@ python -m bot.main
 | `BOT_TOKEN` | `bot/config.py`, `api.py` | ✅ | Бот не стартує (RuntimeError) |
 | `DATABASE_URL` | `bot/config.py`, `api.py` lifespan | ✅ | Сервер не стартує (RuntimeError) |
 | `REDIS_URL` | `bot/config.py`, rate-limit | ✅ | Бот не стартує, rate-limit вимкнено |
-| `ADMIN_IDS` | `bot/config.py`, `api.py` | ⚠️ | Дефолт: 8589737416,1065496907,1106261803 |
+| `ADMIN_IDS | `12345678,87654321` | Telegram user IDs через запятую (обязательная)
 | `ANTHROPIC_API_KEY` | `api.py` `/generate` | ✅ | `/generate` повертає 503 |
 | `BUH_BOT_TOKEN` | `bot/handlers/admin.py` | ⚠️ | Відправка в бухгалтерію не працює |
 | `BUH_API_URL` | `bot/handlers/admin.py` | ⚠️ | Відправка в бухгалтерію не працює |
