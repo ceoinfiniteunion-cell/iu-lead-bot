@@ -519,8 +519,6 @@ async def health(request: Request):
         status["dlq_size"] = dlq_size
         if dlq_size > 0:
             logger.warning("[DLQ] %d leads pending in queue", dlq_size)
-        else:
-            status["redis"] = "not_configured"
     except Exception:
         status["redis"] = "error"
         status["status"] = "degraded"
