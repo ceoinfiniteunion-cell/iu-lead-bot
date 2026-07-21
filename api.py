@@ -23,6 +23,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# ── Sentry ────────────────────────────────────────────────────────────
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.asyncio import AsyncioIntegration
+
+_sentry_dsn = os.environ.get("SENTRY_DSN", "")
+if _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        integrations=[FastApiIntegration(), AsyncioIntegration()],
+        traces_sample_rate=0.2,
+        environment=os.environ.get("ENVIRONMENT", "production"),
+        send_default_pii=False,
+    )
+    logger.info("Sentry initialized")
 # ── Circuit breaker (Redis-backed, distributed) ──────────────────────
 CB_THRESHOLD = 3
 CB_TIMEOUT = 60
