@@ -23,27 +23,28 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ── Circuit breaker ───────────────────────────────────────────────────
-_cb_failures = 0
-_cb_open_until = 0.0
+# ── Circuit breaker (Redis-backed, distributed) ──────────────────────
 CB_THRESHOLD = 3
 CB_TIMEOUT = 60
+CB_FAILURES_KEY = "cb:failures"
+CB_OPEN_UNTIL_KEY = "cb:open_until"
 
-def cb_is_open() -> bool:
-    return time.time() < _cb_open_until
+async def cb_is_open(r: aioredis.Redis) -> bool:
+    val = await r.get(CB_OPEN_UNTIL_KEY)
+    if val is None:
+        return False
+    return time.time() < float(val)
 
-def cb_record_failure():
-    global _cb_failures, _cb_open_until
-    _cb_failures += 1
-    if _cb_failures >= CB_THRESHOLD:
-        _cb_open_until = time.time() + CB_TIMEOUT
+async def cb_record_failure(r: aioredis.Redis):
+    failures = await r.incr(CB_FAILURES_KEY)
+    await r.expire(CB_FAILURES_KEY, CB_TIMEOUT * 2)
+    if failures >= CB_THRESHOLD:
+        open_until = time.time() + CB_TIMEOUT
+        await r.set(CB_OPEN_UNTIL_KEY, str(open_until), ex=CB_TIMEOUT)
         logger.warning("[CIRCUIT_BREAKER] Opened — blocking for %ds", CB_TIMEOUT)
 
-def cb_record_success():
-    global _cb_failures, _cb_open_until
-    _cb_failures = 0
-    _cb_open_until = 0.0
+async def cb_record_success(r: aioredis.Redis):
+    await r.delete(CB_FAILURES_KEY, CB_OPEN_UNTIL_KEY)
 
 # ── Dead letter queue ─────────────────────────────────────────────────
 DLQ_KEY = "dlq:leads"
@@ -439,7 +440,7 @@ async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
             logger.warning("[SECURITY] Invalid signature from IP %s", ip)
             raise HTTPException(status_code=403, detail="Invalid signature")
 
-    if cb_is_open():
+    if await cb_is_open(r):
         logger.warning("[CIRCUIT_BREAKER] Request blocked for IP %s", ip)
         raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
 
@@ -475,16 +476,16 @@ async def generate_site(req: GenerateRequest, request: Request, r: RedisDep):
             )
             data = await resp.json()
             if resp.status != 200:
-                cb_record_failure()
+                await cb_record_failure(r)
                 logger.error("Anthropic API error %d for IP %s", resp.status, ip)
                 raise HTTPException(status_code=502, detail="AI service error")
-            cb_record_success()
+            await cb_record_success(r)
             logger.info("Generate OK for IP %s", ip)
             return data
         except HTTPException:
             raise
         except Exception:
-            cb_record_failure()
+            await cb_record_failure(r)
             logger.exception("Anthropic API call failed for IP %s", ip)
             raise HTTPException(status_code=502, detail="AI service error")
 
@@ -494,8 +495,7 @@ async def health(request: Request):
         "status": "ok",
         "db": "unknown",
         "redis": "unknown",
-        "circuit_breaker": "open" if cb_is_open() else "closed",
-        "cb_failures": _cb_failures,
+        "circuit_breaker": "open" if await cb_is_open(request.app.state.redis) else "closed",
     }
 
     try:
